@@ -1,0 +1,21 @@
+logger:
+  file:
+    path: /var/log/open5gs/upf.log
+  level: info
+upf:
+  pfcp:
+    server:
+      - address: 127.0.0.7
+    client:
+      smf:
+        - address: 127.0.0.4
+  gtpu:
+    server:
+      - address: {{ ansible_host }} # <--- DINAMIS
+  session:
+    - subnet: 10.45.0.0/16
+      gateway: 10.45.0.1
+  metrics:
+    server:
+      - address: 127.0.0.7
+        port: 9090

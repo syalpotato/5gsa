@@ -1,0 +1,15 @@
+mcc: '999'
+mnc: '70'
+nci: '0x000000010'
+idLength: 32
+tac: 1
+linkIp: {{ ansible_host }}  # <--- Otomatis ambil IP Node-02
+ngapIp: {{ ansible_host }}
+gtpIp: {{ ansible_host }}
+amfConfigs:
+  - address: {{ core_ip }}  # <--- Otomatis ambil IP Node-01 dari Inventory
+    port: 38412
+slices:
+  - sst: 1
+    sd: 0x000000
+ignoreStreamIds: true

@@ -1,0 +1,192 @@
+---
+- name: "Legacy Deployment: Core Network & Monitoring (Node-01)"
+  hosts: masters
+  become: yes
+  vars:
+    # Variabel untuk Grafana/Prometheus
+    prom_port: 9091
+    grafana_port: 3001
+  tasks:
+    # --- 1. PREREQUISITES & REPOS ---
+    - name: Install Basic Tools
+      apt:
+        name: [curl, gnupg, git, software-properties-common, iptables-persistent, net-tools]
+        state: present
+        update_cache: yes
+
+    - name: Install Node.js 18 (Fix WebUI)
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+        apt-get install -y nodejs
+
+    - name: Add MongoDB Repo (Fix Package Missing)
+      shell: |
+        curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.asc
+        echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-6.0.asc ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+
+    - name: Add Open5GS PPA
+      apt_repository:
+        repo: 'ppa:open5gs/latest'
+        state: present
+
+    - name: Add Grafana Repo
+      shell: |
+        mkdir -p /etc/apt/keyrings/
+        wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | tee /etc/apt/keyrings/grafana.gpg > /dev/null
+        echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" | tee /etc/apt/sources.list.d/grafana.list
+
+    # --- 2. INSTALL PACKAGES ---
+    - name: Install All Services
+      apt:
+        name:
+          - mongodb-org
+          - open5gs
+          - open5gs-webui
+          - prometheus
+          - prometheus-node-exporter
+          - grafana
+        state: present
+        update_cache: yes
+
+    - name: Start Basic Services
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop: [mongod, prometheus, grafana-server]
+
+    # --- 3. CONFIGURATION (CORE) ---
+    - name: Ensure Config Dir
+      file: path=/etc/open5gs state=directory mode='0755'
+
+    - name: Deploy AMF Config (Dynamic IP)
+      template:
+        src: templates/amf.yaml.j2
+        dest: /etc/open5gs/amf.yaml
+        mode: '0644'
+      notify: Restart Open5GS
+
+    - name: Deploy UPF Config (Dynamic IP)
+      template:
+        src: templates/upf.yaml.j2
+        dest: /etc/open5gs/upf.yaml
+        mode: '0644'
+      notify: Restart Open5GS
+
+    - name: Fix WebUI Bind (Allow External Access)
+      lineinfile:
+        path: /lib/systemd/system/open5gs-webui.service
+        insertafter: '^\[Service\]'
+        line: 'Environment="HOST=0.0.0.0" "PORT=3000"'
+      notify: Restart WebUI
+
+    - name: Setup NAT Masquerade (Fix Internet UE)
+      iptables:
+        table: nat
+        chain: POSTROUTING
+        source: 10.45.0.0/16
+        out_interface: enp1s0 # Pastikan ini interface internet VM (bisa enp1s0 atau eth0)
+        jump: MASQUERADE
+
+    - name: Enable IPv4 Forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+
+    # --- 4. CONFIGURATION (MONITORING) ---
+    - name: Fix Prometheus Port Conflict (9090 -> 9091)
+      lineinfile:
+        path: /etc/default/prometheus
+        regexp: '^ARGS='
+        line: 'ARGS="--web.listen-address=0.0.0.0:{{ prom_port }}"'
+      notify: Restart Prometheus
+
+    - name: Configure Prometheus Targets (Scrape Open5GS)
+      blockinfile:
+        path: /etc/prometheus/prometheus.yml
+        block: |
+          scrape_configs:
+            - job_name: 'open5gs'
+              static_configs:
+                - targets: ['127.0.0.5:9090', '127.0.0.4:9090', '127.0.0.7:9090']
+      notify: Restart Prometheus
+
+    - name: Fix Grafana Port Conflict (3000 -> 3001)
+      lineinfile:
+        path: /etc/grafana/grafana.ini
+        regexp: '^;http_port = 3000'
+        line: 'http_port = {{ grafana_port }}'
+      notify: Restart Grafana
+
+  handlers:
+    - name: Restart Open5GS
+      service: name={{ item }} state=restarted
+      loop: [open5gs-amfd, open5gs-upfd]
+    - name: Restart WebUI
+      systemd: name=open5gs-webui state=restarted daemon_reload=yes
+    - name: Restart Prometheus
+      service: name=prometheus state=restarted
+    - name: Restart Grafana
+      service: name=grafana-server state=restarted
+
+- name: "Legacy Deployment: RAN & UE (Node-02)"
+  hosts: workers
+  become: yes
+  vars:
+    # Ambil IP Node-01 secara otomatis dari inventory
+    core_ip: "{{ hostvars['node-01']['ansible_host'] }}" 
+  tasks:
+    # --- 1. DEPENDENCIES ---
+    - name: Install Build Tools
+      apt:
+        name: [cmake, make, gcc, g++, pkg-config, libfftw3-dev, libmbedtls-dev, libsctp-dev, libyaml-cpp-dev, libgtest-dev, libuhd-dev, uhd-host, git, iperf3]
+        state: present
+
+    # --- 2. FIRMWARE ---
+    - name: Download UHD Firmware (B2xx Only - Fix Error)
+      command: uhd_images_downloader -t b2xx
+      args:
+        creates: /usr/share/uhd/images/usrp_b200_fw.hex
+
+    # --- 3. CLONE & BUILD ---
+    - name: Clone UERANSIM
+      git:
+        repo: 'https://github.com/aligungr/UERANSIM.git'
+        dest: /home/ubuntu/UERANSIM
+        version: HEAD
+        force: yes
+
+    - name: Fix Ownership
+      file: path=/home/ubuntu owner=ubuntu group=ubuntu recurse=yes
+
+    - name: Build UERANSIM
+      shell: make
+      args:
+        chdir: /home/ubuntu/UERANSIM
+        creates: /home/ubuntu/UERANSIM/build/nr-gnb
+
+    # --- 4. CONFIGURATION ---
+    - name: Deploy gNB Config (Dynamic IP)
+      template:
+        src: templates/open5gs-gnb.yaml.j2
+        dest: /home/ubuntu/UERANSIM/config/open5gs-gnb.yaml
+        owner: ubuntu
+
+    - name: Deploy UE Config (Dynamic IP)
+      template:
+        src: templates/open5gs-ue.yaml.j2
+        dest: /home/ubuntu/UERANSIM/config/open5gs-ue.yaml
+        owner: ubuntu
+
+        # --- 5. AUTO-REGISTER SUBSCRIBERS ---
+    - name: Copy Registration Script
+      copy:
+        src: scripts/register_users.sh  # Simpan script di atas di folder ansible/scripts/ di laptop
+        dest: /home/ubuntu/register_users.sh
+        mode: '0755'
+      
+    - name: Execute Registration Script
+      command: /home/ubuntu/register_users.sh
+      register: reg_output
+      changed_when: "'terdaftar' in reg_output.stdout"

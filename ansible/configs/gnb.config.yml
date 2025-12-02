@@ -1,0 +1,55 @@
+cu_cp:
+  inactivity_timer: 7200
+
+# srsRAN gNB Config
+amf:
+  addr: 192.168.122.66      # IP Core
+  bind_addr: 192.168.122.237 # [FIXED] IP Node-02 (Jangan pakai IP Node-01!)
+
+ru_sdr:
+  device_driver: uhd
+  device_args: type=b200
+  srate: 23.04
+  tx_gain: 80
+  rx_gain: 40
+
+cell_cfg:
+  dl_arfcn: 627340
+  band: 78
+  channel_bandwidth_MHz: 20
+  common_scs: 30
+  plmn: "99970"     # [FIXED] Ganti ke 99970
+  tac: 1            # [FIXED] Ganti ke 1
+
+  # low latency TDD
+  pusch:
+    min_k2: 2  # 4
+    tdd_ul_dl_cfg:
+      dl_ul_tx_period: 4  # 10
+      nof_dl_slots: 2  # 6
+      nof_dl_symbols: 10  # 8
+      nof_ul_slots: 1  # 3
+      nof_ul_symbols: 0  # 0
+
+  pucch:
+    sr_period_ms: 2
+    min_k1: 2
+
+  mac_cell_group:
+    bsr_cfg:
+      periodic_bsr_timer: 1
+
+  # QAM256
+  pdsch:
+    mcs_table: qam256
+
+  ssb:
+    ssb_period: 20
+
+log:
+  filename: /tmp/gnb.log
+  all_level: info
+
+metrics:
+  enable_json_metrics: true
+  addr: 172.19.1.4
