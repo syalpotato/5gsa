@@ -1,0 +1,68 @@
+---
+- name: "Update Configurations: Core Network (Node-01)"
+  hosts: masters
+  become: yes
+  tasks:
+    # --- 1. UPDATE CONFIG CORE ---
+    - name: Deploy AMF Config
+      template:
+        src: templates/amf.yaml
+        dest: /etc/open5gs/amf.yaml
+        mode: '0644'
+      
+    - name: Deploy UPF Config
+      template:
+        src: templates/upf.yaml
+        dest: /etc/open5gs/upf.yaml
+        mode: '0644'
+
+    # --- 2. UPDATE ROUTING (Jaga-jaga kalau hilang) ---
+    - name: Ensure IPv4 Forwarding
+      sysctl: name=net.ipv4.ip_forward value='1' sysctl_set=yes
+
+    - name: Ensure NAT Masquerade
+      iptables:
+        table: nat
+        chain: POSTROUTING
+        source: 10.45.0.0/16
+        out_interface: enp1s0 # Sesuaikan jika nama interface beda (misal eth0)
+        jump: MASQUERADE
+
+    # --- 3. RESTART SERVICES (Wajib biar config ngefek) ---
+    - name: Restart Core Services
+      service:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - open5gs-amfd
+        - open5gs-upfd
+        - open5gs-smfd
+        - open5gs-nrfd
+        - open5gs-ausfd
+        - open5gs-udmd
+        - open5gs-udrd
+        - open5gs-pcfd
+        - open5gs-nssfd
+        - open5gs-bsfd
+
+- name: "Update Configurations: RAN & UE (Node-02)"
+  hosts: workers
+  become: yes
+  vars:
+    # Ambil IP Node-01 otomatis
+    core_ip: "{{ hostvars['node-01']['ansible_host'] }}"
+  tasks:
+    # --- 1. UPDATE CONFIG RAN ---
+    - name: Deploy gNB Config (UERANSIM)
+      template:
+        src: templates/open5gs-gnb.yaml
+        dest: /home/ubuntu/UERANSIM/config/open5gs-gnb.yaml
+        owner: ubuntu
+        mode: '0644'
+
+    - name: Deploy UE Config (UERANSIM)
+      template:
+        src: templates/open5gs-ue.yaml
+        dest: /home/ubuntu/UERANSIM/config/open5gs-ue.yaml
+        owner: ubuntu
+        mode: '0644'

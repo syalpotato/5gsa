@@ -1,47 +1,73 @@
 ---
-- name: "Legacy Deployment: Core Network & Monitoring (Node-01)"
+# ----------------------------
+# Fix system clock after snapshot revert (DARI SCRIPT KAMU)
+# ----------------------------
+- name: "System Time Fix"
+  hosts: all
+  become: yes
+  tasks:
+      # --- 0. FIX JAM (WAJIB SETELAH SNAPSHOT) ---
+      - name: Force Sync System Time
+        shell: |
+          date -s "$(wget -qSO- --max-redirect=0 google.com 2>&1 | grep '^Date:' | cut -d' ' -f3-6)Z"
+        ignore_errors: yes
+        become: yes
+      
+      # ... baru task config lainnya ...
+
+- name: "Legacy Deployment: Core Network (Node-01)"
   hosts: masters
   become: yes
   vars:
-    # Variabel untuk Grafana/Prometheus
     prom_port: 9091
     grafana_port: 3001
   tasks:
-    # --- 1. PREREQUISITES & REPOS ---
-    - name: Install Basic Tools
+    # --- BAGIAN 1: PREREQ---
+    - name: Install Prerequisites
       apt:
-        name: [curl, gnupg, git, software-properties-common, iptables-persistent, net-tools]
+        name: [gnupg, curl, software-properties-common, git, iptables-persistent, net-tools]
         state: present
         update_cache: yes
 
-    - name: Install Node.js 18 (Fix WebUI)
-      shell: |
-        curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-        apt-get install -y nodejs
+    # [Node.js 18 Wajib untuk WebUI Manual
+    - name: Setup Node.js 18 Repo
+      shell: curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+      
+    - name: Install Node.js
+      apt: name=nodejs state=present
 
-    - name: Add MongoDB Repo (Fix Package Missing)
-      shell: |
-        curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.asc
-        echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-6.0.asc ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+    # --- BAGIAN 2: MONGODB ---
+    - name: Add MongoDB GPG Key
+      get_url:
+        url: https://pgp.mongodb.com/server-6.0.asc
+        dest: /usr/share/keyrings/mongodb-server-6.0.asc
+        mode: '0644'
 
+    - name: Add MongoDB Repository
+      apt_repository:
+        repo: "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-6.0.asc ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse"
+        state: present
+        filename: mongodb-org-6.0
+
+    # --- BAGIAN 3: OPEN5GS & MONITORING ---
     - name: Add Open5GS PPA
       apt_repository:
         repo: 'ppa:open5gs/latest'
         state: present
-
+    
+    # Add Grafana Repo
     - name: Add Grafana Repo
       shell: |
         mkdir -p /etc/apt/keyrings/
         wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | tee /etc/apt/keyrings/grafana.gpg > /dev/null
         echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" | tee /etc/apt/sources.list.d/grafana.list
 
-    # --- 2. INSTALL PACKAGES ---
-    - name: Install All Services
+    - name: Install Open5GS Core & Monitoring
       apt:
         name:
           - mongodb-org
           - open5gs
-          - open5gs-webui
+          # WebUI di-skip disini (install manual di bawah)
           - prometheus
           - prometheus-node-exporter
           - grafana
@@ -55,38 +81,73 @@
         enabled: yes
       loop: [mongod, prometheus, grafana-server]
 
-    # --- 3. CONFIGURATION (CORE) ---
-    - name: Ensure Config Dir
-      file: path=/etc/open5gs state=directory mode='0755'
+# --- 4. BUILD WEBUI  ---
+    - name: Clone Open5GS WebUI Source
+      git:
+        repo: 'https://github.com/open5gs/open5gs.git'
+        dest: /home/ubuntu/open5gs-source
+        version: main
+        force: yes
+    
+    - name: Install WebUI Dependencies (NPM)
+      shell: |
+        cd /home/ubuntu/open5gs-source/webui
+        npm install
+        npm run build
+      # Proses ini agak lama (1-3 menit)
 
-    - name: Deploy AMF Config (Dynamic IP)
+    # [CRITICAL FIX] Membuat Service Systemd Custom yang memaksa HOST=0.0.0.0
+    - name: Create Custom WebUI Service
+      copy:
+        dest: /lib/systemd/system/open5gs-webui.service
+        content: |
+          [Unit]
+          Description=Open5GS WebUI (Custom Build)
+          After=mongod.service network.target
+          
+          [Service]
+          Type=simple
+          WorkingDirectory=/home/ubuntu/open5gs-source/webui
+          # INI KUNCINYA: Paksa Bind ke semua IP
+          Environment="NODE_ENV=production"
+          Environment="HOST=0.0.0.0"
+          Environment="PORT=3000"
+          # Jalankan langsung via NPM
+          ExecStart=/usr/bin/npm run start
+          Restart=always
+          RestartSec=2
+          
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start WebUI Service
+      systemd: 
+        name: open5gs-webui 
+        state: restarted 
+        enabled: yes 
+        daemon_reload: yes
+        
+    # --- BAGIAN 5: CONFIG & NETWORK ---
+    - name: Ensure Open5GS Config Directory Exists
+      file:
+        path: /etc/open5gs
+        state: directory
+        mode: '0755'
+
+    # -- FILE CONFIG --
+    - name: Configure AMF
       template:
         src: templates/amf.yaml.j2
         dest: /etc/open5gs/amf.yaml
         mode: '0644'
-      notify: Restart Open5GS
+      notify: Restart Open5GS Services
 
-    - name: Deploy UPF Config (Dynamic IP)
+    - name: Configure UPF
       template:
         src: templates/upf.yaml.j2
         dest: /etc/open5gs/upf.yaml
         mode: '0644'
-      notify: Restart Open5GS
-
-    - name: Fix WebUI Bind (Allow External Access)
-      lineinfile:
-        path: /lib/systemd/system/open5gs-webui.service
-        insertafter: '^\[Service\]'
-        line: 'Environment="HOST=0.0.0.0" "PORT=3000"'
-      notify: Restart WebUI
-
-    - name: Setup NAT Masquerade (Fix Internet UE)
-      iptables:
-        table: nat
-        chain: POSTROUTING
-        source: 10.45.0.0/16
-        out_interface: enp1s0 # Pastikan ini interface internet VM (bisa enp1s0 atau eth0)
-        jump: MASQUERADE
+      notify: Restart Open5GS Services
 
     - name: Enable IPv4 Forwarding
       sysctl:
@@ -94,15 +155,24 @@
         value: '1'
         sysctl_set: yes
 
-    # --- 4. CONFIGURATION (MONITORING) ---
-    - name: Fix Prometheus Port Conflict (9090 -> 9091)
+    # NAT Masquerade (Supaya UE bisa internetan)
+    - name: Setup NAT
+      iptables:
+        table: nat
+        chain: POSTROUTING
+        source: 10.45.0.0/16
+        out_interface: enp1s0 # Sesuaikan interface (eth0/enp1s0)
+        jump: MASQUERADE
+
+    # --- BAGIAN 6: FIX MONITORING PORTS ---
+    - name: Fix Prometheus Port (9091)
       lineinfile:
         path: /etc/default/prometheus
         regexp: '^ARGS='
         line: 'ARGS="--web.listen-address=0.0.0.0:{{ prom_port }}"'
       notify: Restart Prometheus
 
-    - name: Configure Prometheus Targets (Scrape Open5GS)
+    - name: Configure Prometheus Targets
       blockinfile:
         path: /etc/prometheus/prometheus.yml
         block: |
@@ -112,7 +182,7 @@
                 - targets: ['127.0.0.5:9090', '127.0.0.4:9090', '127.0.0.7:9090']
       notify: Restart Prometheus
 
-    - name: Fix Grafana Port Conflict (3000 -> 3001)
+    - name: Fix Grafana Port (3001)
       lineinfile:
         path: /etc/grafana/grafana.ini
         regexp: '^;http_port = 3000'
@@ -120,36 +190,80 @@
       notify: Restart Grafana
 
   handlers:
-    - name: Restart Open5GS
+    - name: Restart Open5GS Services
       service: name={{ item }} state=restarted
       loop: [open5gs-amfd, open5gs-upfd]
-    - name: Restart WebUI
-      systemd: name=open5gs-webui state=restarted daemon_reload=yes
     - name: Restart Prometheus
       service: name=prometheus state=restarted
     - name: Restart Grafana
       service: name=grafana-server state=restarted
 
+
 - name: "Legacy Deployment: RAN & UE (Node-02)"
   hosts: workers
   become: yes
   vars:
-    # Ambil IP Node-01 secara otomatis dari inventory
-    core_ip: "{{ hostvars['node-01']['ansible_host'] }}" 
+    core_ip: "{{ hostvars['node-01']['ansible_host'] }}"
   tasks:
-    # --- 1. DEPENDENCIES ---
-    - name: Install Build Tools
+    # --- BAGIAN 1: DEPENDENCIES (DARI SCRIPT KAMU + IPERF3) ---
+    - name: Install Build Dependencies
       apt:
-        name: [cmake, make, gcc, g++, pkg-config, libfftw3-dev, libmbedtls-dev, libsctp-dev, libyaml-cpp-dev, libgtest-dev, libuhd-dev, uhd-host, git, iperf3]
+        name:
+          - cmake
+          - make
+          - gcc
+          - g++
+          - pkg-config
+          - libfftw3-dev
+          - libmbedtls-dev
+          - libsctp-dev
+          - libyaml-cpp-dev
+          - libgtest-dev
+          - libuhd-dev
+          - uhd-host
+          - git
+          - iperf3 # Tambahan buat speedtest
         state: present
+        update_cache: yes
 
-    # --- 2. FIRMWARE ---
-    - name: Download UHD Firmware (B2xx Only - Fix Error)
+    - name: Download UHD Images (B2xx Only)
       command: uhd_images_downloader -t b2xx
       args:
-        creates: /usr/share/uhd/images/usrp_b200_fw.hex
+        creates: /usr/share/uhd/images/usrp_b205mini_fpga.bin
 
-    # --- 3. CLONE & BUILD ---
+    # --- BAGIAN 2: SRSRAN (DARI SCRIPT KAMU - TIDAK DIUBAH) ---
+    - name: Clone srsRAN Source Code
+      git:
+        repo: 'https://github.com/srsRAN/srsRAN_Project.git'
+        dest: /home/ubuntu/srsRAN_Project
+        version: HEAD
+        force: yes
+      
+    - name: Fix Ownership of Source Code
+      file:
+        path: /home/ubuntu/srsRAN_Project
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+
+    - name: Create Build Directory
+      file:
+        path: /home/ubuntu/srsRAN_Project/build
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+
+    - name: Run CMake (Configure)
+      command: cmake ../
+      args:
+        chdir: /home/ubuntu/srsRAN_Project/build
+
+    - name: Run Make (Compile)
+      command: make -j2
+      args:
+        chdir: /home/ubuntu/srsRAN_Project/build
+
+    # --- BAGIAN 3: UERANSIM ---
     - name: Clone UERANSIM
       git:
         repo: 'https://github.com/aligungr/UERANSIM.git'
@@ -157,36 +271,21 @@
         version: HEAD
         force: yes
 
-    - name: Fix Ownership
-      file: path=/home/ubuntu owner=ubuntu group=ubuntu recurse=yes
-
     - name: Build UERANSIM
-      shell: make
+      shell: make -j2
       args:
         chdir: /home/ubuntu/UERANSIM
         creates: /home/ubuntu/UERANSIM/build/nr-gnb
 
-    # --- 4. CONFIGURATION ---
-    - name: Deploy gNB Config (Dynamic IP)
+    # --- BAGIAN 4: CONFIG DEPLOYMENT ---
+    - name: Deploy gNB Config (Pake Template biar IP bener)
       template:
         src: templates/open5gs-gnb.yaml.j2
         dest: /home/ubuntu/UERANSIM/config/open5gs-gnb.yaml
         owner: ubuntu
 
-    - name: Deploy UE Config (Dynamic IP)
+    - name: Deploy UE Config (Pake Template biar IP bener)
       template:
         src: templates/open5gs-ue.yaml.j2
         dest: /home/ubuntu/UERANSIM/config/open5gs-ue.yaml
         owner: ubuntu
-
-        # --- 5. AUTO-REGISTER SUBSCRIBERS ---
-    - name: Copy Registration Script
-      copy:
-        src: scripts/register_users.sh  # Simpan script di atas di folder ansible/scripts/ di laptop
-        dest: /home/ubuntu/register_users.sh
-        mode: '0755'
-      
-    - name: Execute Registration Script
-      command: /home/ubuntu/register_users.sh
-      register: reg_output
-      changed_when: "'terdaftar' in reg_output.stdout"
