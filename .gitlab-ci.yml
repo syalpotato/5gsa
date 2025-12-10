@@ -1,0 +1,60 @@
+stages:
+  - test
+  - deploy_core
+  - deploy_ran
+
+variables:
+  ANSIBLE_HOST_KEY_CHECKING: "False"
+  ANSIBLE_FORCE_COLOR: "true"
+
+# --- STAGE 1: TEST (Syntax Check) ---
+ansible_lint:
+  stage: test
+  tags:
+    - laptop-runner
+  script:
+    - echo "Checking Ansible playbook syntax..."
+    - ansible-playbook -i ansible/inventory.ini ansible/legacy-deploy.yml --syntax-check
+
+# --- STAGE 2: DEPLOY CORE NETWORK (Node-01) ---
+deploy_core_network:
+  stage: deploy_core
+  tags:
+    - laptop-runner
+  only:
+    - main
+  before_script:
+    # 1. Start the SSH Agent
+    - eval $(ssh-agent -s)
+    
+    # 2. Set correct permissions. $SSH_PRIVATE_KEY is a PATH to the file.
+    - chmod 600 "$SSH_PRIVATE_KEY" 
+    
+    # 3. Add the key by reading the file at the path provided by the variable.
+    - ssh-add "$SSH_PRIVATE_KEY"
+    
+    # 4. Standard SSH setup
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - echo "Deploying 5G Core Network to masters (Node-01)..."
+    - ansible-playbook -i ansible/inventory.ini ansible/legacy-deploy.yml --limit masters
+
+# --- STAGE 3: DEPLOY RAN (Node-02) ---
+deploy_radio_access:
+  stage: deploy_ran
+  tags:
+    - laptop-runner
+  only:
+    - main
+  needs:
+    - job: deploy_core_network
+  before_script:
+    - eval $(ssh-agent -s)
+    - chmod 600 "$SSH_PRIVATE_KEY"
+    - ssh-add <(echo "$SSH_PRIVATE_KEY")   # same safer method
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - echo "Deploying gNodeB and UE to workers (Node-02)..."
+    - ansible-playbook -i ansible/inventory.ini ansible/legacy-deploy.yml --limit workers
